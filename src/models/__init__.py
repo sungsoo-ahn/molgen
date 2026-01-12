@@ -24,6 +24,12 @@ from src.models.pairformer_flow import (
     PairFormerFlow,
     create_pairformer_from_config,
 )
+from src.models.pairmixer import (
+    NodeFromEdgeAttention,
+    PairMixerBlock,
+    PairMixerFlow,
+    create_pairmixer_from_config,
+)
 
 __all__ = [
     "SMILESLSTM",
@@ -47,4 +53,9 @@ __all__ = [
     "PairFormerBlock",
     "PairFormerFlow",
     "create_pairformer_from_config",
+    # PairMixer
+    "NodeFromEdgeAttention",
+    "PairMixerBlock",
+    "PairMixerFlow",
+    "create_pairmixer_from_config",
 ]

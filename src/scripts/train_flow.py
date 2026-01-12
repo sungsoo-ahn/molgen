@@ -9,6 +9,7 @@ from typing import List, Optional, Set
 
 import torch
 import torch.nn as nn
+from torch.amp import autocast, GradScaler
 import wandb
 import yaml
 from rdkit import Chem
@@ -25,12 +26,14 @@ from src.data.graph import (
     BOND_TYPES,
     MolecularGraphConverter,
     MolecularGraphDataset,
+    PreprocessedMolecularGraphDataset,
     create_mask_from_sizes,
     get_size_distribution,
     sample_molecule_sizes,
 )
 from src.models.dit import GraphDiT, create_model_from_config
 from src.models.pairformer_flow import PairFormerFlow, create_pairformer_from_config
+from src.models.pairmixer import PairMixerFlow, create_pairmixer_from_config
 from src.models.flow_matching import (
     FlowMatchingModule,
     FlowMatchingSampler,
@@ -102,8 +105,19 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     grad_clip: float = 1.0,
+    scaler: Optional[GradScaler] = None,
+    mixed_precision_dtype: Optional[torch.dtype] = None,
 ) -> dict:
     """Train for one epoch.
+
+    Args:
+        model: FlowMatchingModule
+        dataloader: Training data loader
+        optimizer: Optimizer
+        device: Device for computation
+        grad_clip: Gradient clipping norm
+        scaler: GradScaler for mixed precision (None to disable)
+        mixed_precision_dtype: dtype for autocast (torch.bfloat16 or torch.float16)
 
     Returns:
         Dictionary with average loss components
@@ -114,17 +128,28 @@ def train_epoch(
     total_loss_edges = 0.0
     num_batches = 0
 
+    use_amp = scaler is not None and mixed_precision_dtype is not None
+
     for batch in tqdm(dataloader, desc="Training", leave=False):
         x = batch["node_features"].to(device)
         adj = batch["adjacency"].to(device)
         mask = batch["mask"].to(device)
 
         optimizer.zero_grad()
-        loss, metrics = model.compute_loss(x, adj, mask)
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        optimizer.step()
+        if use_amp:
+            with autocast(device_type="cuda", dtype=mixed_precision_dtype):
+                loss, metrics = model.compute_loss(x, adj, mask)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss, metrics = model.compute_loss(x, adj, mask)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            optimizer.step()
 
         total_loss += metrics["loss_total"]
         total_loss_nodes += metrics["loss_nodes"]
@@ -142,8 +167,15 @@ def validate(
     model: FlowMatchingModule,
     dataloader: DataLoader,
     device: torch.device,
+    mixed_precision_dtype: Optional[torch.dtype] = None,
 ) -> dict:
     """Validate model.
+
+    Args:
+        model: FlowMatchingModule
+        dataloader: Validation data loader
+        device: Device for computation
+        mixed_precision_dtype: dtype for autocast (torch.bfloat16 or torch.float16)
 
     Returns:
         Dictionary with average loss components
@@ -154,13 +186,19 @@ def validate(
     total_loss_edges = 0.0
     num_batches = 0
 
+    use_amp = mixed_precision_dtype is not None
+
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validating", leave=False):
             x = batch["node_features"].to(device)
             adj = batch["adjacency"].to(device)
             mask = batch["mask"].to(device)
 
-            loss, metrics = model.compute_loss(x, adj, mask)
+            if use_amp:
+                with autocast(device_type="cuda", dtype=mixed_precision_dtype):
+                    loss, metrics = model.compute_loss(x, adj, mask)
+            else:
+                loss, metrics = model.compute_loss(x, adj, mask)
 
             total_loss += metrics["loss_total"]
             total_loss_nodes += metrics["loss_nodes"]
@@ -294,71 +332,108 @@ def main(config_path: str, overwrite: bool = False) -> None:
     data_dir = Path(config.get("data_dir", "data/raw"))
     dataset_config = config["dataset"]
     graph_config = config.get("graph", {})
-
-    print("Loading datasets...")
-    train_smiles = load_dataset(
-        dataset_config["name"],
-        data_dir,
-        split="train",
-        train_ratio=dataset_config.get("train_split", 0.8),
-        valid_ratio=dataset_config.get("valid_split", 0.1),
-    )
-    valid_smiles = load_dataset(
-        dataset_config["name"],
-        data_dir,
-        split="valid",
-        train_ratio=dataset_config.get("train_split", 0.8),
-        valid_ratio=dataset_config.get("valid_split", 0.1),
-    )
-
-    print(f"Train size: {len(train_smiles)}, Valid size: {len(valid_smiles)}")
-
-    # Build canonical training set for novelty computation
-    print("Building canonical training set for novelty computation...")
-    train_canonical: Set[str] = set()
-    for smiles in tqdm(train_smiles, desc="Canonicalizing", leave=False):
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is not None:
-            train_canonical.add(Chem.MolToSmiles(mol))
-    print(f"Canonical training set size: {len(train_canonical)}")
-
-    # Create graph converter
-    print("Creating graph converter...")
-
-    # Determine atom types based on dataset
+    preprocessed_dir = config.get("preprocessed_dir", None)
     dataset_name = dataset_config["name"].lower()
-    if "atom_types" in graph_config:
-        atom_types = graph_config["atom_types"]
-    elif dataset_name == "qm9":
-        atom_types = ATOM_TYPES_QM9
+
+    # Check for preprocessed data
+    if preprocessed_dir:
+        preprocessed_path = Path(preprocessed_dir)
     else:
-        atom_types = ATOM_TYPES_ZINC
+        preprocessed_path = Path("data/preprocessed") / dataset_name
 
-    max_atoms = graph_config.get("max_atoms", 9 if dataset_name == "qm9" else 38)
+    use_preprocessed = preprocessed_path.exists() and (preprocessed_path / "train.pt").exists()
 
-    converter = MolecularGraphConverter(
-        atom_types=atom_types,
-        bond_types=BOND_TYPES,
-        max_atoms=max_atoms,
-    )
+    if use_preprocessed:
+        print(f"Loading preprocessed data from {preprocessed_path}...")
+
+        # Load preprocessed tensors (instant)
+        train_dataset = PreprocessedMolecularGraphDataset(preprocessed_path / "train.pt")
+        valid_dataset = PreprocessedMolecularGraphDataset(preprocessed_path / "valid.pt")
+
+        print(f"Train size: {len(train_dataset)}, Valid size: {len(valid_dataset)}")
+
+        # Load canonical training set
+        print("Loading canonical training set...")
+        with open(preprocessed_path / "train_canonical.json", "r") as f:
+            train_canonical: Set[str] = set(json.load(f))
+        print(f"Canonical training set size: {len(train_canonical)}")
+
+        # Load size distribution
+        print("Loading size distribution...")
+        with open(preprocessed_path / "size_distribution.json", "r") as f:
+            size_distribution = {int(k): v for k, v in json.load(f).items()}
+
+        # Load converter
+        converter = MolecularGraphConverter.load(preprocessed_path / "graph_converter.json")
+
+    else:
+        print("Loading datasets from raw SMILES (use preprocess_dataset.py for faster loading)...")
+        max_samples = dataset_config.get("max_samples", None)
+        train_smiles = load_dataset(
+            dataset_config["name"],
+            data_dir,
+            split="train",
+            train_ratio=dataset_config.get("train_split", 0.8),
+            valid_ratio=dataset_config.get("valid_split", 0.1),
+            max_samples=max_samples,
+        )
+        valid_smiles = load_dataset(
+            dataset_config["name"],
+            data_dir,
+            split="valid",
+            train_ratio=dataset_config.get("train_split", 0.8),
+            valid_ratio=dataset_config.get("valid_split", 0.1),
+            max_samples=max_samples,
+        )
+
+        print(f"Train size: {len(train_smiles)}, Valid size: {len(valid_smiles)}")
+
+        # Build canonical training set for novelty computation
+        print("Building canonical training set for novelty computation...")
+        train_canonical: Set[str] = set()
+        for smiles in tqdm(train_smiles, desc="Canonicalizing", leave=False):
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is not None:
+                train_canonical.add(Chem.MolToSmiles(mol))
+        print(f"Canonical training set size: {len(train_canonical)}")
+
+        # Create graph converter
+        print("Creating graph converter...")
+
+        # Determine atom types based on dataset
+        if "atom_types" in graph_config:
+            atom_types = graph_config["atom_types"]
+        elif dataset_name == "qm9":
+            atom_types = ATOM_TYPES_QM9
+        else:
+            atom_types = ATOM_TYPES_ZINC
+
+        max_atoms = graph_config.get("max_atoms", 9 if dataset_name == "qm9" else 38)
+
+        converter = MolecularGraphConverter(
+            atom_types=atom_types,
+            bond_types=BOND_TYPES,
+            max_atoms=max_atoms,
+        )
+
+        # Get molecule size distribution
+        print("Computing molecule size distribution...")
+        size_distribution = get_size_distribution(train_smiles, converter)
+
+        # Create datasets
+        print("Creating datasets...")
+        train_dataset = MolecularGraphDataset(train_smiles, converter)
+        valid_dataset = MolecularGraphDataset(valid_smiles, converter)
+
+    # Save converter and distribution to output dir
     converter.save(output_dir / "graph_converter.json")
-
-    print(f"Atom types: {atom_types}")
-    print(f"Max atoms: {max_atoms}")
-
-    # Get molecule size distribution
-    print("Computing molecule size distribution...")
-    size_distribution = get_size_distribution(train_smiles, converter)
+    print(f"Atom types: {converter.atom_types}")
+    print(f"Max atoms: {converter.max_atoms}")
     print(f"Size distribution: {size_distribution}")
 
     # Save size distribution
     with open(output_dir / "size_distribution.json", "w") as f:
         json.dump(size_distribution, f, indent=2)
-
-    # Create datasets
-    print("Creating datasets...")
-    train_dataset = MolecularGraphDataset(train_smiles, converter)
-    valid_dataset = MolecularGraphDataset(valid_smiles, converter)
 
     print(f"Valid training samples: {len(train_dataset)}")
     print(f"Valid validation samples: {len(valid_dataset)}")
@@ -402,6 +477,21 @@ def main(config_path: str, overwrite: bool = False) -> None:
         ).to(device)
         print(f"Architecture: PairFormer (triangle_mult={model_config.get('use_triangle_mult', True)}, "
               f"triangle_attn={model_config.get('use_triangle_attn', True)})")
+    elif architecture == "pairmixer":
+        # Create PairMixer model (edge-only backbone)
+        backbone = PairMixerFlow(
+            num_atom_types=converter.num_atom_types,
+            num_bond_types=converter.num_bond_types,
+            max_atoms=converter.max_atoms,
+            hidden_dim_z=model_config.get("hidden_dim_z", model_config.get("hidden_dim", 128)),
+            hidden_dim_s=model_config.get("hidden_dim_s", model_config.get("hidden_dim", 128)),
+            num_layers=model_config.get("num_layers", 6),
+            num_heads=model_config.get("num_heads", 4),
+            mlp_ratio=model_config.get("mlp_ratio", 4.0),
+            dropout=model_config.get("dropout", 0.1),
+            t_embed_dim=model_config.get("t_embed_dim"),
+        ).to(device)
+        print(f"Architecture: PairMixer (edge-only backbone)")
     else:
         # Create GraphDiT model (default)
         # Extract positional encoding config
@@ -423,19 +513,160 @@ def main(config_path: str, overwrite: bool = False) -> None:
         ).to(device)
         print(f"Architecture: GraphDiT (PE type: {pe_type})")
 
-    # Create flow matching wrapper
+    # Create flow matching wrapper with time sampling config
     fm_config = config.get("flow_matching", {})
-    scheduler = FlowMatchingScheduler(sigma_min=fm_config.get("sigma_min", 0.001))
+    time_sampling = fm_config.get("time_sampling", "uniform")
+    time_sampling_params = fm_config.get("time_sampling_params", {})
+    scheduler = FlowMatchingScheduler(
+        sigma_min=fm_config.get("sigma_min", 0.001),
+        time_sampling=time_sampling,
+        time_sampling_params=time_sampling_params,
+    )
     model = FlowMatchingModule(backbone, scheduler)
+    if time_sampling != "uniform":
+        print(f"Time sampling: {time_sampling} with params {time_sampling_params}")
 
     print(f"Model parameters: {backbone.count_parameters():,}")
 
-    # Setup optimizer with weight decay
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=training_config.get("learning_rate", 0.0001),
-        weight_decay=training_config.get("weight_decay", 0.01),
-    )
+    # Optional: Compile model with torch.compile for speedup
+    compile_model = training_config.get("compile", False)
+    if compile_model and torch.cuda.is_available():
+        try:
+            backbone = torch.compile(backbone, mode="reduce-overhead")
+            print("Model compiled with torch.compile (reduce-overhead mode)")
+        except Exception as e:
+            print(f"torch.compile failed: {e}")
+
+    # Setup optimizer
+    optimizer_name = training_config.get("optimizer", "adamw").lower()
+    lr = training_config.get("learning_rate", 0.0001)
+    weight_decay = training_config.get("weight_decay", 0.01)
+
+    if optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=training_config.get("betas", (0.9, 0.999)),
+        )
+    elif optimizer_name == "adam":
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=lr,
+            betas=training_config.get("betas", (0.9, 0.999)),
+        )
+    elif optimizer_name == "muon":
+        # Muon optimizer - ONLY works with 2D weight matrices
+        # Use separate AdamW for non-2D params (embeddings, biases, etc.)
+        try:
+            from torch.optim import Muon
+
+            muon_params = []
+            adamw_params = []
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    # Muon ONLY works with 2D weight matrices
+                    if param.dim() == 2 and param.size(0) > 1 and param.size(1) > 1:
+                        muon_params.append(param)
+                    else:
+                        adamw_params.append(param)
+
+            if not muon_params:
+                print("Warning: No 2D params found for Muon, falling back to AdamW")
+                optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+            else:
+                # Create Muon optimizer for 2D weight matrices only
+                muon_lr = training_config.get("muon_lr", lr * 0.02)
+                muon_opt = Muon(
+                    muon_params,
+                    lr=muon_lr,
+                    momentum=training_config.get("muon_momentum", 0.95),
+                    weight_decay=weight_decay,
+                )
+                # Create separate AdamW for non-2D params
+                if adamw_params:
+                    adamw_opt = torch.optim.AdamW(adamw_params, lr=lr, weight_decay=weight_decay)
+                    # Use a combined optimizer wrapper
+                    class CombinedOptimizer:
+                        """Wrapper for multiple optimizers that supports LR scheduling."""
+                        def __init__(self, optimizers):
+                            self.optimizers = optimizers
+                            self.param_groups = []
+                            for opt in optimizers:
+                                self.param_groups.extend(opt.param_groups)
+                            self._schedulers = None
+
+                        def zero_grad(self):
+                            for opt in self.optimizers:
+                                opt.zero_grad()
+
+                        def step(self):
+                            for opt in self.optimizers:
+                                opt.step()
+
+                        def state_dict(self):
+                            return [opt.state_dict() for opt in self.optimizers]
+
+                        def load_state_dict(self, states):
+                            for opt, state in zip(self.optimizers, states):
+                                opt.load_state_dict(state)
+
+                        def create_schedulers(self, scheduler_fn):
+                            """Create LR schedulers for each underlying optimizer."""
+                            self._schedulers = [scheduler_fn(opt) for opt in self.optimizers]
+                            return self
+
+                        def scheduler_step(self):
+                            """Step all LR schedulers."""
+                            if self._schedulers:
+                                for sched in self._schedulers:
+                                    sched.step()
+
+                        def get_last_lr(self):
+                            """Get the last learning rate from the first scheduler."""
+                            if self._schedulers:
+                                return self._schedulers[0].get_last_lr()
+                            return [self.param_groups[0]['lr']]
+
+                    optimizer = CombinedOptimizer([muon_opt, adamw_opt])
+                else:
+                    optimizer = muon_opt
+                print(f"Muon optimizer: {len(muon_params)} Muon params (lr={muon_lr}), {len(adamw_params)} AdamW params (lr={lr})")
+        except (ImportError, AttributeError) as e:
+            print(f"Warning: Muon not available ({e}), falling back to AdamW")
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=lr,
+            momentum=training_config.get("momentum", 0.9),
+            weight_decay=weight_decay,
+        )
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_name}")
+
+    print(f"Optimizer: {optimizer_name}, LR: {lr}, Weight decay: {weight_decay}")
+
+    # Setup mixed precision training
+    mixed_precision = training_config.get("mixed_precision", False)
+    mixed_precision_dtype = None
+    scaler = None
+
+    if mixed_precision:
+        mp_type = training_config.get("mixed_precision_type", "bf16")
+        if mp_type == "bf16":
+            mixed_precision_dtype = torch.bfloat16
+            # bf16 doesn't need GradScaler but we use it for consistency
+            scaler = GradScaler(enabled=False)  # Disabled for bf16, just pass through
+            print("Mixed precision: bfloat16 (no scaling needed)")
+        elif mp_type == "fp16":
+            mixed_precision_dtype = torch.float16
+            scaler = GradScaler()
+            print("Mixed precision: float16 with GradScaler")
+        else:
+            print(f"Warning: Unknown mixed_precision_type '{mp_type}', using bf16")
+            mixed_precision_dtype = torch.bfloat16
+            scaler = GradScaler(enabled=False)
 
     # Setup learning rate scheduler
     num_epochs = training_config["epochs"]
@@ -444,7 +675,16 @@ def main(config_path: str, overwrite: bool = False) -> None:
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = warmup_epochs * steps_per_epoch
 
-    lr_scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    # Check if optimizer is CombinedOptimizer (for Muon)
+    is_combined_optimizer = hasattr(optimizer, 'create_schedulers')
+    if is_combined_optimizer:
+        # Create schedulers for each underlying optimizer
+        def make_scheduler(opt):
+            return get_cosine_schedule_with_warmup(opt, warmup_steps, total_steps)
+        optimizer.create_schedulers(make_scheduler)
+        lr_scheduler = None  # Use optimizer's scheduler_step instead
+    else:
+        lr_scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     # Sampling config
     sampling_config = config.get("sampling", {})
@@ -472,12 +712,17 @@ def main(config_path: str, overwrite: bool = False) -> None:
             optimizer,
             device,
             grad_clip=training_config.get("grad_clip", 1.0),
+            scaler=scaler,
+            mixed_precision_dtype=mixed_precision_dtype,
         )
 
         # Step LR scheduler
-        lr_scheduler.step()
+        if is_combined_optimizer:
+            optimizer.scheduler_step()
+        else:
+            lr_scheduler.step()
 
-        valid_metrics = validate(model, valid_loader, device)
+        valid_metrics = validate(model, valid_loader, device, mixed_precision_dtype=mixed_precision_dtype)
 
         history["train_loss"].append(train_metrics["loss"])
         history["valid_loss"].append(valid_metrics["loss"])
@@ -563,17 +808,16 @@ def main(config_path: str, overwrite: bool = False) -> None:
             patience_counter += 1
 
         # Save latest checkpoint
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": lr_scheduler.state_dict(),
-                "train_loss": train_metrics["loss"],
-                "valid_loss": valid_metrics["loss"],
-            },
-            output_dir / "checkpoints" / "latest_checkpoint.pt",
-        )
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "train_loss": train_metrics["loss"],
+            "valid_loss": valid_metrics["loss"],
+        }
+        if lr_scheduler is not None:
+            checkpoint["scheduler_state_dict"] = lr_scheduler.state_dict()
+        torch.save(checkpoint, output_dir / "checkpoints" / "latest_checkpoint.pt")
 
         # Early stopping
         if patience_counter >= patience:
