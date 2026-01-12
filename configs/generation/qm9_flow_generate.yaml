@@ -1,0 +1,12 @@
+# QM9 Flow Matching Generation Configuration
+output_dir: "data/experiments/qm9_flow/generation"
+exp_dir: "data/experiments/qm9_flow"
+
+generation:
+  num_samples: 10000
+  batch_size: 64
+  checkpoint: "best_model.pt"
+
+sampling:
+  num_steps: 100
+  method: "heun"

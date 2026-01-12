@@ -1,0 +1,6 @@
+# QM9 Evaluation Configuration
+output_dir: "data/experiments/qm9_lstm/evaluation"
+exp_dir: "data/experiments/qm9_lstm"
+
+evaluation:
+  generated_file: "generation/generated_smiles_t1.0.txt"
