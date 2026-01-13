@@ -95,6 +95,7 @@ def load_dataset(
     train_ratio: float = 0.8,
     valid_ratio: float = 0.1,
     seed: int = 42,
+    max_samples: int = None,
 ) -> List[str]:
     """Load SMILES dataset by name.
 
@@ -105,6 +106,7 @@ def load_dataset(
         train_ratio: Fraction for training set
         valid_ratio: Fraction for validation set
         seed: Random seed for splitting
+        max_samples: If provided, limit total samples before splitting (for quick testing)
 
     Returns:
         List of SMILES strings
@@ -119,6 +121,12 @@ def load_dataset(
         raise ValueError(f"Unknown dataset: {name}. Use 'qm9' or 'zinc'.")
 
     smiles_list = load_smiles_from_csv(csv_path)
+
+    # Limit total samples if specified (for quick testing)
+    if max_samples is not None and max_samples < len(smiles_list):
+        random.seed(seed)
+        smiles_list = random.sample(smiles_list, max_samples)
+
     train_smiles, valid_smiles, test_smiles = split_dataset(
         smiles_list, train_ratio, valid_ratio, seed
     )

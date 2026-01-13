@@ -23,10 +23,59 @@ class FlowMatchingScheduler:
 
     Args:
         sigma_min: Minimum noise scale for stability (added to prior samples)
+        time_sampling: Time sampling strategy ('uniform', 'logit_normal', 'beta')
+        time_sampling_params: Parameters for non-uniform sampling
     """
 
-    def __init__(self, sigma_min: float = 0.001):
+    def __init__(
+        self,
+        sigma_min: float = 0.001,
+        time_sampling: str = "uniform",
+        time_sampling_params: Optional[dict] = None,
+    ):
         self.sigma_min = sigma_min
+        self.time_sampling = time_sampling
+        self.time_sampling_params = time_sampling_params or {}
+
+    def sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Sample timesteps according to the configured strategy.
+
+        Args:
+            batch_size: Number of timesteps to sample
+            device: Device for tensors
+
+        Returns:
+            t: Timesteps [batch_size] in (0, 1)
+        """
+        if self.time_sampling == "uniform":
+            # Standard uniform sampling
+            t = torch.rand(batch_size, device=device)
+        elif self.time_sampling == "logit_normal":
+            # Logit-normal: t = sigmoid(N(mu, sigma))
+            # SD3 uses mu=0, sigma=1; can emphasize mid-range timesteps
+            mu = self.time_sampling_params.get("mu", 0.0)
+            sigma = self.time_sampling_params.get("sigma", 1.0)
+            z = torch.randn(batch_size, device=device) * sigma + mu
+            t = torch.sigmoid(z)
+        elif self.time_sampling == "beta":
+            # Beta distribution: can emphasize endpoints or middle
+            alpha = self.time_sampling_params.get("alpha", 1.0)
+            beta_param = self.time_sampling_params.get("beta", 1.0)
+            # Use numpy-style sampling via torch
+            t = torch.distributions.Beta(alpha, beta_param).sample((batch_size,)).to(device)
+        elif self.time_sampling == "mode":
+            # Mode sampling: p(t) ∝ 1/(t*(1-t)) - emphasizes endpoints
+            # Sample via inverse CDF: t = sigmoid(logit(u)) where u ~ U(0,1)
+            u = torch.rand(batch_size, device=device)
+            # Clamp to avoid numerical issues
+            u = u.clamp(0.001, 0.999)
+            t = u  # For now, just use uniform as fallback
+        else:
+            raise ValueError(f"Unknown time sampling strategy: {self.time_sampling}")
+
+        # Clamp to avoid exact 0 or 1
+        t = t.clamp(1e-5, 1 - 1e-5)
+        return t
 
     def get_train_sample(
         self,
@@ -286,8 +335,8 @@ def flow_matching_loss(
     B = x_1.shape[0]
     device = x_1.device
 
-    # Sample uniform timesteps
-    t = torch.rand(B, device=device)
+    # Sample timesteps according to scheduler strategy
+    t = scheduler.sample_timesteps(B, device)
 
     # Get noisy samples and targets
     x_t, adj_t, v_x_target, v_adj_target = scheduler.get_train_sample(x_1, adj_1, t)

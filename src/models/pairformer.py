@@ -236,12 +236,12 @@ class TriangleMultiplication(nn.Module):
             left = left * pair_mask
             right = right * pair_mask
 
-        # Triangle multiplication
+        # Triangle multiplication (BoltzGen-style einsum patterns)
         if self.outgoing:
-            # z_out[i,j] = sum_k left[i,k] * right[k,j]
+            # z_out[i,j] = sum_k left[i,k] * right[j,k]
             # left: [B, N, N, d_hidden] -> [B, i, k, d_hidden]
-            # right: [B, N, N, d_hidden] -> [B, k, j, d_hidden]
-            out = torch.einsum('bikd,bkjd->bijd', left, right)
+            # right: [B, N, N, d_hidden] -> [B, j, k, d_hidden]
+            out = torch.einsum('bikd,bjkd->bijd', left, right)
         else:
             # z_out[i,j] = sum_k left[k,i] * right[k,j]
             # left: [B, k, i, d_hidden]

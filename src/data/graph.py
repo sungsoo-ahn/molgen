@@ -199,12 +199,13 @@ class MolecularGraphConverter:
             return None
 
     def smiles_to_tensors(
-        self, smiles: str
+        self, smiles: str, kekulize: bool = False
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Convert SMILES string to tensor representation.
 
         Args:
             smiles: SMILES string
+            kekulize: If True, convert aromatic bonds to single/double bonds
 
         Returns:
             Tuple of (x, adj, mask) tensors, or None if SMILES is invalid
@@ -214,8 +215,13 @@ class MolecularGraphConverter:
             return None
 
         try:
+            if kekulize:
+                Chem.Kekulize(mol, clearAromaticFlags=True)
             return self.mol_to_tensors(mol)
         except ValueError:
+            return None
+        except Exception:
+            # Kekulization can fail for some molecules
             return None
 
     def tensors_to_smiles(
@@ -386,6 +392,32 @@ def sample_molecule_sizes(
     # Map to sizes
     sizes_tensor = torch.tensor(sizes, device=device)
     return sizes_tensor[indices]
+
+
+class PreprocessedMolecularGraphDataset(Dataset):
+    """PyTorch Dataset for preprocessed molecular graph tensors.
+
+    Loads pre-converted tensors from a .pt file for fast iteration.
+
+    Args:
+        tensor_path: Path to .pt file with preprocessed tensors
+    """
+
+    def __init__(self, tensor_path: Path):
+        data = torch.load(tensor_path, weights_only=True)
+        self.node_features = data["node_features"]
+        self.adjacency = data["adjacency"]
+        self.mask = data["mask"]
+
+    def __len__(self) -> int:
+        return len(self.node_features)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        return {
+            "node_features": self.node_features[idx],
+            "adjacency": self.adjacency[idx],
+            "mask": self.mask[idx],
+        }
 
 
 def create_mask_from_sizes(
