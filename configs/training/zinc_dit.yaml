@@ -13,15 +13,15 @@ graph:
   bond_types: ["none", "single", "double", "triple"]
   max_atoms: 38
 
-# Model architecture (GraphDiT)
+# Model architecture (GraphDiT) - reduced for batch=32
 model:
   architecture: "graphdit"
-  hidden_dim: 256
-  num_layers: 8
-  num_heads: 8
+  hidden_dim: 128
+  num_layers: 6
+  num_heads: 4
   mlp_ratio: 4.0
   dropout: 0.1
-  t_embed_dim: 256
+  t_embed_dim: 128
 
 # Flow matching settings
 flow_matching:
@@ -35,7 +35,7 @@ sampling:
 # Training settings (Muon optimizer)
 training:
   epochs: 200
-  batch_size: 4  # Reduced from 16 due to OOM with seq_len=1482 (attention is O(seq²))
+  batch_size: 32  # Increased with smaller model
   optimizer: "muon"
   learning_rate: 0.01  # For non-Muon params
   muon_lr: 0.2  # Muon LR for 2D weights
@@ -53,4 +53,4 @@ data_dir: "data/raw"
 # Weights & Biases
 wandb:
   project: "molgen"
-  name: "hp_muon_v2"
+  name: "zinc_dit"

@@ -57,4 +57,4 @@ data_dir: "data/raw"
 # Weights & Biases
 wandb:
   project: "molgen"
-  name: "hp_muon_v2"
+  name: "qm9_dit"

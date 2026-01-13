@@ -13,16 +13,16 @@ graph:
   bond_types: ["none", "single", "double", "triple"]
   max_atoms: 38
 
-# Model architecture (PairFormer)
+# Model architecture (PairFormer) - reduced for batch=32
 model:
   architecture: "pairformer"
-  hidden_dim_s: 256  # Node track dimension
-  hidden_dim_z: 128  # Edge track dimension
-  num_layers: 8
-  num_heads: 8
+  hidden_dim_s: 128  # Node track dimension
+  hidden_dim_z: 64   # Edge track dimension
+  num_layers: 6
+  num_heads: 4
   mlp_ratio: 4.0
   dropout: 0.1
-  t_embed_dim: 256
+  t_embed_dim: 128
   use_triangle_mult: true
   use_triangle_attn: true
 
@@ -38,7 +38,7 @@ sampling:
 # Training settings (Muon optimizer)
 training:
   epochs: 200
-  batch_size: 8  # Reduced from 64 due to OOM with N=38 (O(N³) triangle ops)
+  batch_size: 32  # Increased with smaller model
   optimizer: "muon"
   learning_rate: 0.01  # For non-Muon params
   muon_lr: 0.2  # Muon LR for 2D weights
@@ -56,4 +56,4 @@ data_dir: "data/raw"
 # Weights & Biases
 wandb:
   project: "molgen"
-  name: "hp_muon_v2"
+  name: "zinc_pairformer"
