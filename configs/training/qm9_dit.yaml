@@ -1,5 +1,5 @@
-# QM9 Flow Matching with Graph Distance Positional Encoding
-output_dir: "data/experiments/qm9_flow_graphdist"
+# QM9 Flow Matching with DiT (Diffusion Transformer) Architecture
+output_dir: "data/experiments/qm9_dit"
 
 # Dataset settings
 dataset:
@@ -13,17 +13,15 @@ graph:
   bond_types: ["none", "single", "double", "triple", "aromatic"]
   max_atoms: 9
 
-# Model architecture (GraphDiT with graph distance PE)
+# Model architecture (DiT/GraphDiT)
 model:
+  architecture: "graphdit"
   hidden_dim: 256
   num_layers: 8
   num_heads: 8
   mlp_ratio: 4.0
   dropout: 0.1
   t_embed_dim: 256
-  positional_encoding:
-    type: "graph_distance"
-    max_graph_distance: 8
 
 # Flow matching settings
 flow_matching:
@@ -38,13 +36,20 @@ sampling:
 training:
   epochs: 200
   batch_size: 256
-  learning_rate: 0.0001
-  weight_decay: 0.01
+  optimizer: "muon"
+  learning_rate: 0.01  # For non-Muon params (embeddings, biases)
+  muon_lr: 0.2  # Muon LR for 2D weight matrices
+  muon_momentum: 0.95
+  weight_decay: 0.0  # Muon works better without weight decay
   grad_clip: 1.0
   warmup_epochs: 10
   early_stopping_patience: 20
   eval_interval: 10
   num_eval_samples: 1000
+  # Speed optimizations
+  mixed_precision: true
+  mixed_precision_type: "bf16"
+  compile: true
 
 # Data directory
 data_dir: "data/raw"
@@ -52,4 +57,4 @@ data_dir: "data/raw"
 # Weights & Biases
 wandb:
   project: "molgen"
-  name: "qm9_flow_graphdist"
+  name: "hp_muon_v2"

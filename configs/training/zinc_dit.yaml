@@ -1,0 +1,56 @@
+# ZINC Flow Matching with GraphDiT Architecture
+output_dir: "data/experiments/zinc_dit"
+
+# Dataset settings
+dataset:
+  name: "zinc"
+  train_split: 0.8
+  valid_split: 0.1
+
+# Graph representation settings (kekulized - no aromatic bonds)
+graph:
+  atom_types: ["C", "N", "O", "F", "S", "Cl", "Br", "P", "I"]
+  bond_types: ["none", "single", "double", "triple"]
+  max_atoms: 38
+
+# Model architecture (GraphDiT)
+model:
+  architecture: "graphdit"
+  hidden_dim: 256
+  num_layers: 8
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.1
+  t_embed_dim: 256
+
+# Flow matching settings
+flow_matching:
+  sigma_min: 0.001
+
+# Sampling settings
+sampling:
+  num_steps: 100
+  method: "heun"
+
+# Training settings (Muon optimizer)
+training:
+  epochs: 200
+  batch_size: 4  # Reduced from 16 due to OOM with seq_len=1482 (attention is O(seq²))
+  optimizer: "muon"
+  learning_rate: 0.01  # For non-Muon params
+  muon_lr: 0.2  # Muon LR for 2D weights
+  muon_momentum: 0.95
+  weight_decay: 0.0
+  grad_clip: 1.0
+  warmup_epochs: 10
+  early_stopping_patience: 20
+  eval_interval: 10
+  num_eval_samples: 1000
+
+# Data directory
+data_dir: "data/raw"
+
+# Weights & Biases
+wandb:
+  project: "molgen"
+  name: "hp_muon_v2"
